@@ -39,44 +39,68 @@ function App() {
 
     newSocket.on('file-chunk', (data) => {
       const { chunk, fileName, isLast, fileType } = data;
-      fileChunksRef.current.push(new Uint8Array(chunk));
       
-      // Calculate progress (rough estimate)
-      setFileProgress(prev => Math.min(prev + 10, 90));
-      
-      if (isLast) {
-        // Combine chunks and create download
-        const totalLength = fileChunksRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
-        const combined = new Uint8Array(totalLength);
-        let offset = 0;
-        fileChunksRef.current.forEach(chunk => {
-          combined.set(chunk, offset);
-          offset += chunk.length;
-        });
-        
-        const blob = new Blob([combined], { type: fileType || 'application/octet-stream' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        
-        setReceivedFiles(prev => [...prev, { name: fileName, receivedAt: new Date() }]);
-        setIncomingFile(null);
-        setFileProgress(0);
-        fileChunksRef.current = [];
-        
-        // Notify sender
-        newSocket.emit('file-received', { sessionId, fileName });
-      }
+      // Process chunks asynchronously to prevent blocking
+      setTimeout(() => {
+        try {
+          fileChunksRef.current.push(new Uint8Array(chunk));
+          
+          // Calculate progress (rough estimate)
+          setFileProgress(prev => Math.min(prev + 10, 90));
+          
+          if (isLast) {
+            // Process last chunk asynchronously to prevent blocking
+            setTimeout(() => {
+              try {
+                // Combine chunks and create download
+                const totalLength = fileChunksRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
+                const combined = new Uint8Array(totalLength);
+                let offset = 0;
+                fileChunksRef.current.forEach(chunk => {
+                  combined.set(chunk, offset);
+                  offset += chunk.length;
+                });
+                
+                const blob = new Blob([combined], { type: fileType || 'application/octet-stream' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                
+                setReceivedFiles(prev => [...prev, { name: fileName, receivedAt: new Date() }]);
+                setIncomingFile(null);
+                setFileProgress(0);
+                fileChunksRef.current = [];
+                
+                // Notify sender
+                newSocket.emit('file-received', { sessionId, fileName });
+              } catch (error) {
+                console.error('Error processing file chunks:', error);
+                alert(`Error processing file "${fileName}": ${error.message}`);
+                setIncomingFile(null);
+                setFileProgress(0);
+                fileChunksRef.current = [];
+              }
+            }, 0);
+          }
+        } catch (error) {
+          console.error('Error handling file chunk:', error);
+        }
+      }, 0);
     });
 
     newSocket.on('file-sent', (data) => {
       console.log('File sent successfully:', data);
       alert(`File "${data.fileName}" sent successfully!`);
+    });
+
+    newSocket.on('file-error', (data) => {
+      console.error('File error:', data);
+      alert(data.message || 'File transfer error occurred');
     });
 
     newSocket.on('peer-disconnected', () => {
@@ -126,7 +150,15 @@ function App() {
       return;
     }
 
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB in bytes
+
     Array.from(files).forEach(file => {
+      // Check file size
+      if (file.size > MAX_FILE_SIZE) {
+        alert(`File "${file.name}" is too large. Maximum file size is 5MB.`);
+        return;
+      }
+
       // Show confirmation dialog before sending
       const fileSizeKB = (file.size / 1024).toFixed(2);
       const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
@@ -278,7 +310,7 @@ function App() {
               <div className="received-files">
                 <h3>Received Files:</h3>
                 <ul>
-                  {receivedFiles.map((file, index) => (
+                  {[...receivedFiles].sort((a, b) => b.receivedAt - a.receivedAt).map((file, index) => (
                     <li key={index}>
                       {file.name} - {file.receivedAt.toLocaleTimeString()}
                     </li>
