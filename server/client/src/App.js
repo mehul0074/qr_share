@@ -127,7 +127,21 @@ function App() {
     }
 
     Array.from(files).forEach(file => {
-      sendFile(file);
+      // Show confirmation dialog before sending
+      const fileSizeKB = (file.size / 1024).toFixed(2);
+      const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+      const sizeDisplay = file.size > 1024 * 1024 ? `${fileSizeMB} MB` : `${fileSizeKB} KB`;
+      
+      const send = window.confirm(
+        `Do you want to send "${file.name}" (${sizeDisplay})?`
+      );
+      
+      if (send) {
+        console.log('User confirmed sending file:', file.name);
+        sendFile(file);
+      } else {
+        console.log('User canceled sending file:', file.name);
+      }
     });
   };
 
@@ -206,19 +220,21 @@ function App() {
           </div>
         </div>
 
-        <div className="qr-section">
-          <h2>Scan this QR code to connect</h2>
-          {qrCode ? (
-            <div className="qr-container">
-              <img src={qrCode} alt="QR Code" style={{ maxWidth: '300px', height: '300px' }} />
-            </div>
-          ) : (
-            <div className="loading">Generating QR code...</div>
-          )}
-          <button onClick={generateSession} className="btn btn-secondary">
-            Generate New QR Code
-          </button>
-        </div>
+        {!connected && (
+          <div className="qr-section">
+            <h2>Scan this QR code to connect</h2>
+            {qrCode ? (
+              <div className="qr-container">
+                <img src={qrCode} alt="QR Code" style={{ maxWidth: '300px', height: '300px' }} />
+              </div>
+            ) : (
+              <div className="loading">Generating QR code...</div>
+            )}
+            <button onClick={generateSession} className="btn btn-secondary">
+              Generate New QR Code
+            </button>
+          </div>
+        )}
 
         {connected && (
           <div className="file-sharing-section">
