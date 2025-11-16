@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "QR Share Mobile",
-    "slug": "qrshare-mobile-new",
+    "slug": "qrshare-mobile",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -36,7 +36,26 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "build": {
+      "development": {
+        "developmentClient": true,
+        "distribution": "internal"
+      },
+      "preview": {
+        "distribution": "internal"
+      },
+      "production": {
+        "autoIncrement": true,
+        "android": {
+          "buildType": "apk"
+        }
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "7a1b99b4-476c-4416-9840-1e54401014f2"
+      }
     }
   }
 }
-

@@ -7,6 +7,8 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
+const cron = require('node-cron');
+const axios = require('axios');
 
 const app = express();
 const server = http.createServer(app);
@@ -81,6 +83,15 @@ app.get('/api/session/:sessionId', (req, res) => {
   } else {
     res.status(404).json({ error: 'Session not found' });
   }
+});
+
+// Health check endpoint for cron job (prevents Render from sleeping)
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    message: 'Server is alive'
+  });
 });
 
 // Serve uploaded files
@@ -185,7 +196,19 @@ io.on('connection', (socket) => {
 
   socket.on('file-meta', (data) => {
     const { sessionId, fileName, fileSize, fileType } = data;
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB in bytes
+    
     console.log(`File metadata received: ${fileName} (${fileSize} bytes)`);
+    
+    // Validate file size
+    if (fileSize > MAX_FILE_SIZE) {
+      console.error(`File "${fileName}" exceeds maximum size of 5MB`);
+      socket.emit('file-error', { 
+        message: `File "${fileName}" is too large. Maximum file size is 5MB.`,
+        fileName 
+      });
+      return;
+    }
     
     // Store file metadata for this session
     fileMetadata.set(sessionId, { fileName, fileType });
@@ -256,10 +279,23 @@ if (process.env.NODE_ENV === 'production' && fs.existsSync(clientBuildPath)) {
 }
 
 const PORT = process.env.PORT || 3001;
+const SERVER_URL = process.env.SERVER_URL || 'https://qr-share-1.onrender.com';
+
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   if (process.env.NODE_ENV === 'production') {
     console.log(`Serving React app from: ${clientBuildPath}`);
+    
+    // Set up cron job to ping health endpoint every 15 minutes (prevents Render from sleeping)
+    cron.schedule('*/15 * * * *', async () => {
+      try {
+        const response = await axios.get(`${SERVER_URL}/api/health`);
+        console.log(`Health check pinged at ${new Date().toISOString()}:`, response.data);
+      } catch (error) {
+        console.error('Health check failed:', error.message);
+      }
+    });
+    console.log('Cron job scheduled: Health check every 15 minutes');
   }
 });
 

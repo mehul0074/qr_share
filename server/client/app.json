@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "ace5cb7a-3db8-40c7-8ec9-ff4e20fb5cbd"
+      }
+    },
+    "android": {
+      "package": "com.mundhava.client"
+    }
+  }
+}

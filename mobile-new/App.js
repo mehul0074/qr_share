@@ -30,6 +30,7 @@ export default function App() {
   const [sessionId, setSessionId] = useState(null);
   const [qrCode, setQrCode] = useState(null);
   const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [socket, setSocket] = useState(null);
   const [incomingFile, setIncomingFile] = useState(null);
   const [fileProgress, setFileProgress] = useState(0);
@@ -37,7 +38,6 @@ export default function App() {
   const fileChunksRef = useRef([]);
   const expectedFileSizeRef = useRef(0);
   const receivedFileSizeRef = useRef(0);
-  const acceptedFilesRef = useRef(new Set()); // Track accepted file names
 
   useEffect(() => {
     // Initialize socket connection
@@ -49,8 +49,8 @@ export default function App() {
     newSocket.on('connection-established', (data) => {
       console.log('Connection established:', data);
       setConnected(true);
+      setConnecting(false);
       setMode('connected');
-      Alert.alert('Success', 'Connection established! You can now share files.');
     });
 
     newSocket.on('session-created', (data) => {
@@ -60,51 +60,17 @@ export default function App() {
 
     newSocket.on('file-incoming', (data) => {
       console.log('File incoming:', data);
-      
-      // Show confirmation dialog before receiving
-      Alert.alert(
-        'Incoming File',
-        `Do you want to receive "${data.fileName}" (${(data.fileSize / 1024).toFixed(2)} KB)?`,
-        [
-          {
-            text: 'Cancel',
-            style: 'cancel',
-            onPress: () => {
-              console.log('User canceled file reception');
-              // Notify sender that file was rejected
-              newSocket.emit('file-rejected', { sessionId, fileName: data.fileName });
-            }
-          },
-          {
-            text: 'Accept',
-            onPress: () => {
-              console.log('User accepted file reception');
-              acceptedFilesRef.current.add(data.fileName);
-              setIncomingFile(data);
-              fileChunksRef.current = [];
-              expectedFileSizeRef.current = data.fileSize || 0;
-              receivedFileSizeRef.current = 0;
-              setFileProgress(0);
-              console.log('Ready to receive file:', data.fileName, 'Expected size:', data.fileSize);
-            }
-          }
-        ]
-      );
+      setIncomingFile(data);
+      fileChunksRef.current = [];
+      expectedFileSizeRef.current = data.fileSize || 0;
+      receivedFileSizeRef.current = 0;
+      setFileProgress(0);
+      console.log('Ready to receive file:', data.fileName, 'Expected size:', data.fileSize);
     });
 
     newSocket.on('file-chunk', async (data) => {
       const { chunk, fileName, isLast, fileType } = data;
       console.log('File chunk received:', { fileName, isLast, chunkSize: chunk?.length });
-      
-      // Only process chunks if user accepted the file
-      if (!acceptedFilesRef.current.has(fileName)) {
-        console.log('File was rejected, ignoring chunk for:', fileName);
-        if (isLast) {
-          // Clean up on last chunk even if rejected
-          acceptedFilesRef.current.delete(fileName);
-        }
-        return;
-      }
       
       if (!chunk || !Array.isArray(chunk)) {
         console.error('Invalid chunk data:', chunk);
@@ -210,11 +176,17 @@ export default function App() {
           setIncomingFile(null);
           setFileProgress(0);
           fileChunksRef.current = [];
-          acceptedFilesRef.current.delete(fileName); // Clean up
           
           newSocket.emit('file-received', { sessionId, fileName });
         } catch (error) {
           console.error('Error processing file chunks:', error);
+          console.error('Error stack:', error.stack);
+          console.error('Error details:', {
+            fileName,
+            fileType,
+            chunksCount: fileChunksRef.current.length,
+            totalLength: fileChunksRef.current.reduce((acc, chunk) => acc + chunk.length, 0),
+          });
           Alert.alert('Error', `Failed to process file: ${error.message}`);
           setFileProgress(0);
           setIncomingFile(null);
@@ -227,9 +199,15 @@ export default function App() {
       Alert.alert('Success', `File "${data.fileName}" sent successfully!`);
     });
 
+    newSocket.on('file-error', (data) => {
+      console.error('File error:', data);
+      Alert.alert('File Error', data.message || 'File transfer error occurred');
+    });
+
     newSocket.on('peer-disconnected', () => {
       console.log('Peer disconnected event received');
       setConnected(false);
+      setConnecting(false);
       setMode('menu');
       Alert.alert('Disconnected', 'Peer disconnected');
     });
@@ -237,6 +215,7 @@ export default function App() {
     newSocket.on('disconnect', (reason) => {
       console.log('Socket disconnected:', reason);
       setConnected(false);
+      setConnecting(false);
       setMode('menu');
       if (reason === 'io server disconnect') {
         // Server disconnected the socket, reconnect manually
@@ -258,7 +237,9 @@ export default function App() {
     newSocket.on('connect_error', (error) => {
       console.error('Socket connection error:', error);
       setConnected(false);
+      setConnecting(false);
       setMode('menu');
+      Alert.alert('Connection Error', 'Failed to connect. Please try again.');
     });
 
     return () => {
@@ -295,10 +276,12 @@ export default function App() {
       } else {
         Alert.alert('Invalid QR Code', 'This QR code is not a valid connection code');
         setMode('menu');
+        setConnecting(false);
       }
     } catch (error) {
       Alert.alert('Error', 'Invalid QR code format');
       setMode('menu');
+      setConnecting(false);
     }
   };
 
@@ -311,7 +294,8 @@ export default function App() {
     });
 
     setSessionId(targetSessionId);
-    Alert.alert('Connecting', 'Attempting to connect...');
+    setConnecting(true);
+    setMode('connected'); // Switch to connected view to show loader
   };
 
   const handleGenerateQR = async () => {
@@ -351,12 +335,23 @@ export default function App() {
         const file = result.assets[0];
         console.log('Selected file (new format):', file);
         
-        // Show confirmation dialog before sending
+        const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB in bytes
         const fileSize = file.size || 0;
+        
+        // Check file size
+        if (fileSize > MAX_FILE_SIZE) {
+          Alert.alert('File Too Large', `File "${file.name || 'file'}" is too large. Maximum file size is 5MB.`);
+          return;
+        }
+        
+        // Show confirmation dialog before sending
         const fileSizeKB = (fileSize / 1024).toFixed(2);
+        const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
+        const sizeDisplay = fileSize > 1024 * 1024 ? `${fileSizeMB} MB` : `${fileSizeKB} KB`;
+        
         Alert.alert(
           'Send File',
-          `Do you want to send "${file.name || 'file'}" (${fileSizeKB} KB)?`,
+          `Do you want to send "${file.name || 'file'}" (${sizeDisplay})?`,
           [
             {
               text: 'Cancel',
@@ -379,12 +374,23 @@ export default function App() {
         // Old API format
         console.log('Selected file (old format):', result);
         
-        // Show confirmation dialog before sending
+        const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB in bytes
         const fileSize = result.size || 0;
+        
+        // Check file size
+        if (fileSize > MAX_FILE_SIZE) {
+          Alert.alert('File Too Large', `File "${result.name || 'file'}" is too large. Maximum file size is 5MB.`);
+          return;
+        }
+        
+        // Show confirmation dialog before sending
         const fileSizeKB = (fileSize / 1024).toFixed(2);
+        const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
+        const sizeDisplay = fileSize > 1024 * 1024 ? `${fileSizeMB} MB` : `${fileSizeKB} KB`;
+        
         Alert.alert(
           'Send File',
-          `Do you want to send "${result.name || 'file'}" (${fileSizeKB} KB)?`,
+          `Do you want to send "${result.name || 'file'}" (${sizeDisplay})?`,
           [
             {
               text: 'Cancel',
@@ -503,7 +509,7 @@ export default function App() {
         fileType: fileType,
       });
 
-      // Send file in chunks
+      // Send file in chunks with delay to prevent overwhelming receiver
       const chunkSize = 64 * 1024; // 64KB
       let offset = 0;
       let chunkNumber = 0;
@@ -515,20 +521,28 @@ export default function App() {
 
         console.log(`Sending chunk ${chunkNumber}, offset: ${offset}, isLast: ${isLast}`);
 
-        socket.emit('file-chunk', {
-          sessionId,
-          chunk: Array.from(chunk),
-          fileName: fileName,
-          isLast,
-        });
+        try {
+          socket.emit('file-chunk', {
+            sessionId,
+            chunk: Array.from(chunk),
+            fileName: fileName,
+            isLast,
+          });
 
-        offset += chunkSize;
+          offset += chunkSize;
 
-        if (!isLast) {
-          setTimeout(sendChunk, 10);
-        } else {
-          console.log('All chunks sent successfully');
-          Alert.alert('Success', `File "${fileName}" sent successfully!`);
+          if (!isLast) {
+            // Add delay between chunks to prevent overwhelming receiver (especially for large files)
+            // Increase delay for larger files to prevent disconnection
+            const delay = fileSize > 2 * 1024 * 1024 ? 50 : 20; // 50ms for files > 2MB, 20ms for smaller
+            setTimeout(sendChunk, delay);
+          } else {
+            console.log('All chunks sent successfully');
+            Alert.alert('Success', `File "${fileName}" sent successfully!`);
+          }
+        } catch (error) {
+          console.error('Error sending chunk:', error);
+          Alert.alert('Error', `Failed to send file chunk: ${error.message}`);
         }
       };
 
@@ -645,20 +659,30 @@ export default function App() {
 
   const renderConnected = () => (
     <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
-      <View style={styles.statusContainer}>
-        <View style={[styles.statusIndicator, connected ? styles.connected : styles.disconnected]}>
-          <Text style={styles.statusText}>
-            {connected ? '✓ Connected' : '○ Disconnected'}
-          </Text>
+      {connecting && !connected ? (
+        <View style={styles.connectingContainer}>
+          <ActivityIndicator size="large" color="#667eea" />
+          <Text style={styles.connectingText}>Connecting to peer...</Text>
+          <Text style={styles.connectingSubtext}>Please wait</Text>
         </View>
-      </View>
-      
-      {!connected && (
-        <View style={styles.disconnectedMessage}>
-          <Text style={styles.disconnectedText}>
-            Connection lost. Please go back to menu and reconnect.
-          </Text>
-        </View>
+      ) : (
+        <>
+          <View style={styles.statusContainer}>
+            <View style={[styles.statusIndicator, connected ? styles.connected : styles.disconnected]}>
+              <Text style={styles.statusText}>
+                {connected ? '✓ Connected' : '○ Disconnected'}
+              </Text>
+            </View>
+          </View>
+          
+          {!connected && !connecting && (
+            <View style={styles.disconnectedMessage}>
+              <Text style={styles.disconnectedText}>
+                Connection lost. Please go back to menu and reconnect.
+              </Text>
+            </View>
+          )}
+        </>
       )}
 
       {connected && (
@@ -686,23 +710,26 @@ export default function App() {
       {receivedFiles.length > 0 && (
         <View style={styles.receivedFiles}>
           <Text style={styles.receivedFilesTitle}>Received Files:</Text>
-          {receivedFiles.map((file, index) => (
-            <TouchableOpacity
-              key={index}
-              style={styles.receivedFileItem}
-              onPress={() => handleOpenFile(file)}
-              activeOpacity={0.7}
-            >
-              <View style={styles.receivedFileInfo}>
+          {[...receivedFiles].sort((a, b) => b.receivedAt - a.receivedAt).map((file, index) => (
+            <View key={index} style={styles.receivedFileItem}>
+              <TouchableOpacity
+                style={styles.receivedFileInfo}
+                onPress={() => handleOpenFile(file)}
+                activeOpacity={0.7}
+              >
                 <Text style={styles.receivedFileName}>{file.name}</Text>
                 <Text style={styles.receivedFileTime}>
                   {file.receivedAt.toLocaleTimeString()}
                 </Text>
-              </View>
-              <View style={styles.openFileButton}>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.openFileButton}
+                onPress={() => handleOpenFile(file)}
+                activeOpacity={0.8}
+              >
                 <Text style={styles.openFileButtonText}>Open</Text>
-              </View>
-            </TouchableOpacity>
+              </TouchableOpacity>
+            </View>
           ))}
         </View>
       )}
@@ -712,6 +739,7 @@ export default function App() {
         onPress={() => {
           setMode('menu');
           setConnected(false);
+          setConnecting(false);
         }}
       >
         <Text style={styles.buttonText}>Disconnect</Text>
@@ -877,6 +905,25 @@ const styles = StyleSheet.create({
   disconnectedText: {
     color: '#856404',
     fontSize: 14,
+    textAlign: 'center',
+  },
+  connectingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 40,
+  },
+  connectingText: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#333',
+    marginTop: 20,
+    textAlign: 'center',
+  },
+  connectingSubtext: {
+    fontSize: 14,
+    color: '#666',
+    marginTop: 8,
     textAlign: 'center',
   },
   incomingFile: {
