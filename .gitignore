@@ -74,7 +74,12 @@ out
 
 # Gatsby files
 .cache/
-public
+# Ignore Gatsby's generated public folder, but NOT React's public folder
+# React apps need their public folder tracked
+!/server/client/public/
+!/**/public/index.html
+!/**/public/manifest.json
+public/
 
 # Serverless directories
 .serverless/
