@@ -1,0 +1,28 @@
+{
+  "name": "qrshare",
+  "version": "1.0.0",
+  "description": "QR Share - File sharing via QR codes",
+  "private": true,
+  "scripts": {
+    "server:build": "cd server && npm run build",
+    "server:start": "cd server && npm start",
+    "server:dev": "cd server && npm run dev",
+    "server:build:start": "cd server && npm run build && npm start",
+    "build": "cd server && npm run build",
+    "start": "cd server && npm run build && npm start",
+    "dev": "cd server && npm run dev",
+    "mobile:start": "cd mobile-new && npm start",
+    "mobile:android": "cd mobile-new && npm run android",
+    "mobile:ios": "cd mobile-new && npm run ios"
+  },
+  "keywords": [
+    "qr",
+    "file-sharing",
+    "websocket",
+    "react",
+    "react-native"
+  ],
+  "author": "",
+  "license": "ISC"
+}
+
