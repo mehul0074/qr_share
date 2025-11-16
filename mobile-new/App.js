@@ -4,22 +4,24 @@ import {
   Text,
   View,
   TouchableOpacity,
-  SafeAreaView,
   ScrollView,
   Alert,
   ActivityIndicator,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
+import { Linking } from 'react-native';
 import io from 'socket.io-client';
 import QRCode from 'react-native-qrcode-svg';
 
 // SERVER_URL Configuration
 // For development: Use your computer's local IP (e.g., 'http://192.168.1.100:3001')
 // For production: Use your production server URL (e.g., 'https://yourdomain.com')
-const SERVER_URL = process.env.EXPO_PUBLIC_SERVER_URL || 'http://localhost:3001';
+const SERVER_URL = process.env.EXPO_PUBLIC_SERVER_URL || 'https://qr-share-1.onrender.com';
 
 export default function App() {
   const [mode, setMode] = useState('menu'); // 'menu', 'scan', 'generate', 'connected'
@@ -33,6 +35,9 @@ export default function App() {
   const [fileProgress, setFileProgress] = useState(0);
   const [receivedFiles, setReceivedFiles] = useState([]);
   const fileChunksRef = useRef([]);
+  const expectedFileSizeRef = useRef(0);
+  const receivedFileSizeRef = useRef(0);
+  const acceptedFilesRef = useRef(new Set()); // Track accepted file names
 
   useEffect(() => {
     // Initialize socket connection
@@ -55,51 +60,166 @@ export default function App() {
 
     newSocket.on('file-incoming', (data) => {
       console.log('File incoming:', data);
-      setIncomingFile(data);
-      fileChunksRef.current = [];
-      setFileProgress(0);
+      
+      // Show confirmation dialog before receiving
+      Alert.alert(
+        'Incoming File',
+        `Do you want to receive "${data.fileName}" (${(data.fileSize / 1024).toFixed(2)} KB)?`,
+        [
+          {
+            text: 'Cancel',
+            style: 'cancel',
+            onPress: () => {
+              console.log('User canceled file reception');
+              // Notify sender that file was rejected
+              newSocket.emit('file-rejected', { sessionId, fileName: data.fileName });
+            }
+          },
+          {
+            text: 'Accept',
+            onPress: () => {
+              console.log('User accepted file reception');
+              acceptedFilesRef.current.add(data.fileName);
+              setIncomingFile(data);
+              fileChunksRef.current = [];
+              expectedFileSizeRef.current = data.fileSize || 0;
+              receivedFileSizeRef.current = 0;
+              setFileProgress(0);
+              console.log('Ready to receive file:', data.fileName, 'Expected size:', data.fileSize);
+            }
+          }
+        ]
+      );
     });
 
-    newSocket.on('file-chunk', (data) => {
+    newSocket.on('file-chunk', async (data) => {
       const { chunk, fileName, isLast, fileType } = data;
-      fileChunksRef.current.push(new Uint8Array(chunk));
+      console.log('File chunk received:', { fileName, isLast, chunkSize: chunk?.length });
       
-      setFileProgress(prev => Math.min(prev + 10, 90));
+      // Only process chunks if user accepted the file
+      if (!acceptedFilesRef.current.has(fileName)) {
+        console.log('File was rejected, ignoring chunk for:', fileName);
+        if (isLast) {
+          // Clean up on last chunk even if rejected
+          acceptedFilesRef.current.delete(fileName);
+        }
+        return;
+      }
+      
+      if (!chunk || !Array.isArray(chunk)) {
+        console.error('Invalid chunk data:', chunk);
+        return;
+      }
+      
+      fileChunksRef.current.push(new Uint8Array(chunk));
+      receivedFileSizeRef.current += chunk.length;
+      
+      // Update progress based on actual received size
+      const currentChunks = fileChunksRef.current.length;
+      let progress = 0;
+      if (expectedFileSizeRef.current > 0) {
+        progress = Math.min((receivedFileSizeRef.current / expectedFileSizeRef.current) * 100, 95);
+      } else {
+        // Fallback: estimate based on chunks
+        progress = Math.min(currentChunks * 2, 95);
+      }
+      setFileProgress(progress);
+      
+      console.log(`Chunk ${currentChunks} received:`, {
+        chunkSize: chunk.length,
+        totalReceived: receivedFileSizeRef.current,
+        expected: expectedFileSizeRef.current,
+        progress: progress.toFixed(1) + '%',
+        isLast
+      });
       
       if (isLast) {
+        console.log('Last chunk received, processing file...');
+        console.log('Total received:', receivedFileSizeRef.current, 'Expected:', expectedFileSizeRef.current);
+        
+        // Verify we received all data
+        if (expectedFileSizeRef.current > 0 && receivedFileSizeRef.current !== expectedFileSizeRef.current) {
+          console.warn('Size mismatch! Received:', receivedFileSizeRef.current, 'Expected:', expectedFileSizeRef.current);
+          // Continue anyway, might be due to rounding
+        }
+        
+        setFileProgress(95);
         // Combine chunks
         const totalLength = fileChunksRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
+        console.log('Combining', fileChunksRef.current.length, 'chunks, total length:', totalLength);
+        
         const combined = new Uint8Array(totalLength);
         let offset = 0;
-        fileChunksRef.current.forEach(chunk => {
+        fileChunksRef.current.forEach((chunk, index) => {
           combined.set(chunk, offset);
           offset += chunk.length;
         });
-
-        // Convert to base64 and save file
-        let binaryString = '';
-        const chunkSize = 8192;
-        for (let i = 0; i < combined.length; i += chunkSize) {
-          const chunk = combined.slice(i, i + chunkSize);
-          binaryString += String.fromCharCode.apply(null, chunk);
-        }
-        const base64 = btoa(binaryString);
-        const fileUri = FileSystem.documentDirectory + fileName;
         
-        FileSystem.writeAsStringAsync(fileUri, base64, {
-          encoding: FileSystem.EncodingType.Base64,
-        }).then(() => {
+        console.log('Chunks combined successfully, size:', combined.length);
+        setFileProgress(98);
+        
+        try {
+          console.log('Converting to base64...');
+          setFileProgress(99);
+          
+          // Get document directory - using legacy API
+          const docDir = FileSystem.documentDirectory || FileSystem.cacheDirectory || '';
+          console.log('Document directory:', docDir);
+          
+          if (!docDir) {
+            throw new Error('Could not determine document directory');
+          }
+          
+          const fileUri = docDir + fileName;
+          console.log('File URI:', fileUri);
+          
+          // Convert Uint8Array to base64 efficiently
+          // Process in chunks to avoid memory issues
+          let binaryString = '';
+          const processChunkSize = 16384; // 16KB chunks
+          
+          for (let i = 0; i < combined.length; i += processChunkSize) {
+            const chunk = combined.slice(i, Math.min(i + processChunkSize, combined.length));
+            const chunkArray = Array.from(chunk);
+            // Build binary string chunk by chunk
+            for (let j = 0; j < chunkArray.length; j++) {
+              binaryString += String.fromCharCode(chunkArray[j]);
+            }
+          }
+          
+          console.log('Encoding to base64, binary length:', binaryString.length);
+          const base64 = btoa(binaryString);
+          console.log('Base64 length:', base64.length);
+          
+          // Use legacy API writeAsStringAsync
+          console.log('Writing file using legacy API...');
+          
+          await FileSystem.writeAsStringAsync(fileUri, base64, {
+            encoding: FileSystem.EncodingType?.Base64 || 'base64',
+          });
+          
+          console.log('File saved successfully!');
+          setFileProgress(100);
           Alert.alert('Success', `File "${fileName}" received and saved!`);
-          setReceivedFiles(prev => [...prev, { name: fileName, receivedAt: new Date() }]);
+          setReceivedFiles(prev => [...prev, { 
+            name: fileName, 
+            receivedAt: new Date(),
+            uri: fileUri,
+            type: fileType || 'application/octet-stream'
+          }]);
           setIncomingFile(null);
           setFileProgress(0);
           fileChunksRef.current = [];
+          acceptedFilesRef.current.delete(fileName); // Clean up
           
           newSocket.emit('file-received', { sessionId, fileName });
-        }).catch(err => {
-          console.error('Error saving file:', err);
-          Alert.alert('Error', 'Failed to save file');
-        });
+        } catch (error) {
+          console.error('Error processing file chunks:', error);
+          Alert.alert('Error', `Failed to process file: ${error.message}`);
+          setFileProgress(0);
+          setIncomingFile(null);
+          fileChunksRef.current = [];
+        }
       }
     });
 
@@ -108,8 +228,36 @@ export default function App() {
     });
 
     newSocket.on('peer-disconnected', () => {
+      console.log('Peer disconnected event received');
       setConnected(false);
+      setMode('menu');
       Alert.alert('Disconnected', 'Peer disconnected');
+    });
+
+    newSocket.on('disconnect', (reason) => {
+      console.log('Socket disconnected:', reason);
+      setConnected(false);
+      setMode('menu');
+      if (reason === 'io server disconnect') {
+        // Server disconnected the socket, reconnect manually
+        Alert.alert('Disconnected', 'Connection lost. Please reconnect.');
+      } else {
+        // Client disconnected or network error
+        Alert.alert('Disconnected', 'Connection lost');
+      }
+    });
+
+    newSocket.on('connect', () => {
+      console.log('Socket connected');
+      // If we were in a session, rejoin it
+      if (sessionId) {
+        newSocket.emit('join-session', { sessionId, type: 'mobile' });
+      }
+    });
+
+    newSocket.on('connect_error', (error) => {
+      console.error('Socket connection error:', error);
+      setConnected(false);
       setMode('menu');
     });
 
@@ -184,56 +332,193 @@ export default function App() {
     }
 
     try {
+      console.log('Opening document picker...');
       const result = await DocumentPicker.getDocumentAsync({
         type: '*/*',
         copyToCacheDirectory: true,
+        multiple: false,
       });
 
-      if (result.type === 'success') {
-        sendFile(result);
+      console.log('Document picker result:', result);
+
+      if (result.canceled) {
+        console.log('User canceled file selection');
+        return;
+      }
+
+      if (result.assets && result.assets.length > 0) {
+        // New API format (Expo SDK 50+)
+        const file = result.assets[0];
+        console.log('Selected file (new format):', file);
+        
+        // Show confirmation dialog before sending
+        const fileSize = file.size || 0;
+        const fileSizeKB = (fileSize / 1024).toFixed(2);
+        Alert.alert(
+          'Send File',
+          `Do you want to send "${file.name || 'file'}" (${fileSizeKB} KB)?`,
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel'
+            },
+            {
+              text: 'Send',
+              onPress: async () => {
+                await sendFile({
+                  uri: file.uri,
+                  name: file.name || 'file',
+                  mimeType: file.mimeType || 'application/octet-stream',
+                  size: file.size || 0,
+                });
+              }
+            }
+          ]
+        );
+      } else if (result.type === 'success') {
+        // Old API format
+        console.log('Selected file (old format):', result);
+        
+        // Show confirmation dialog before sending
+        const fileSize = result.size || 0;
+        const fileSizeKB = (fileSize / 1024).toFixed(2);
+        Alert.alert(
+          'Send File',
+          `Do you want to send "${result.name || 'file'}" (${fileSizeKB} KB)?`,
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel'
+            },
+            {
+              text: 'Send',
+              onPress: async () => {
+                await sendFile(result);
+              }
+            }
+          ]
+        );
+      } else {
+        console.error('Unexpected result format:', result);
+        Alert.alert('Error', 'Unexpected file picker result format');
       }
     } catch (error) {
       console.error('Error picking file:', error);
-      Alert.alert('Error', 'Failed to pick file');
+      Alert.alert('Error', `Failed to pick file: ${error.message}`);
+    }
+  };
+
+  const handleOpenFile = async (file) => {
+    if (!file.uri) {
+      Alert.alert('Error', 'File URI not available');
+      return;
+    }
+
+    try {
+      // Check if file exists
+      const fileInfo = await FileSystem.getInfoAsync(file.uri);
+      if (!fileInfo.exists) {
+        Alert.alert('Error', 'File not found');
+        return;
+      }
+
+      // Check if sharing is available
+      const isAvailable = await Sharing.isAvailableAsync();
+      
+      if (isAvailable) {
+        // Use expo-sharing to open the file
+        await Sharing.shareAsync(file.uri, {
+          mimeType: file.type,
+          dialogTitle: `Open ${file.name}`,
+        });
+      } else {
+        // Fallback: try to open with Linking
+        const canOpen = await Linking.canOpenURL(file.uri);
+        if (canOpen) {
+          await Linking.openURL(file.uri);
+        } else {
+          Alert.alert('Info', `File saved at: ${file.uri}`);
+        }
+      }
+    } catch (error) {
+      console.error('Error opening file:', error);
+      Alert.alert('Error', `Failed to open file: ${error.message}`);
     }
   };
 
   const sendFile = async (fileResult) => {
-    if (!socket || !sessionId) return;
+    if (!socket || !sessionId) {
+      console.error('Cannot send file: socket or sessionId missing');
+      Alert.alert('Error', 'Not connected to a session');
+      return;
+    }
 
     try {
+      console.log('Starting to send file:', fileResult);
+      
+      // Validate file result
+      if (!fileResult.uri) {
+        throw new Error('File URI is missing');
+      }
+
+      console.log('Checking file info for URI:', fileResult.uri);
       const fileInfo = await FileSystem.getInfoAsync(fileResult.uri);
+      
+      if (!fileInfo.exists) {
+        throw new Error('File does not exist at the specified URI');
+      }
+
+      console.log('File info:', fileInfo);
+      console.log('File size:', fileInfo.size);
+
+      const encoding = (FileSystem.EncodingType && FileSystem.EncodingType.Base64) || 'base64';
+      console.log('Reading file with encoding:', encoding);
+      
       const fileContent = await FileSystem.readAsStringAsync(fileResult.uri, {
-        encoding: FileSystem.EncodingType.Base64,
+        encoding: encoding,
       });
 
+      console.log('File read successfully, content length:', fileContent.length);
+
       // Convert base64 to Uint8Array
+      console.log('Converting base64 to Uint8Array...');
       const binaryString = atob(fileContent);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i);
       }
 
+      console.log('Converted to bytes, length:', bytes.length);
+
+      const fileName = fileResult.name || 'file';
+      const fileType = fileResult.mimeType || 'application/octet-stream';
+      const fileSize = fileInfo.size || bytes.length;
+
       // Send file metadata
+      console.log('Sending file metadata:', { fileName, fileSize, fileType });
       socket.emit('file-meta', {
         sessionId,
-        fileName: fileResult.name,
-        fileSize: fileInfo.size,
-        fileType: fileResult.mimeType || 'application/octet-stream',
+        fileName: fileName,
+        fileSize: fileSize,
+        fileType: fileType,
       });
 
       // Send file in chunks
       const chunkSize = 64 * 1024; // 64KB
       let offset = 0;
+      let chunkNumber = 0;
 
       const sendChunk = () => {
         const chunk = bytes.slice(offset, offset + chunkSize);
         const isLast = offset + chunkSize >= bytes.length;
+        chunkNumber++;
+
+        console.log(`Sending chunk ${chunkNumber}, offset: ${offset}, isLast: ${isLast}`);
 
         socket.emit('file-chunk', {
           sessionId,
           chunk: Array.from(chunk),
-          fileName: fileResult.name,
+          fileName: fileName,
           isLast,
         });
 
@@ -241,13 +526,21 @@ export default function App() {
 
         if (!isLast) {
           setTimeout(sendChunk, 10);
+        } else {
+          console.log('All chunks sent successfully');
+          Alert.alert('Success', `File "${fileName}" sent successfully!`);
         }
       };
 
       sendChunk();
     } catch (error) {
       console.error('Error sending file:', error);
-      Alert.alert('Error', 'Failed to send file');
+      console.error('Error details:', {
+        message: error.message,
+        stack: error.stack,
+        fileResult: fileResult,
+      });
+      Alert.alert('Error', `Failed to send file: ${error.message}`);
     }
   };
 
@@ -322,7 +615,7 @@ export default function App() {
   };
 
   const renderQRGenerator = () => (
-    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
+    <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
       <Text style={styles.title}>Your QR Code</Text>
       <Text style={styles.subtitle}>Let others scan this to connect</Text>
 
@@ -351,18 +644,32 @@ export default function App() {
   );
 
   const renderConnected = () => (
-    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
+    <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
       <View style={styles.statusContainer}>
-        <View style={[styles.statusIndicator, styles.connected]}>
-          <Text style={styles.statusText}>✓ Connected</Text>
+        <View style={[styles.statusIndicator, connected ? styles.connected : styles.disconnected]}>
+          <Text style={styles.statusText}>
+            {connected ? '✓ Connected' : '○ Disconnected'}
+          </Text>
         </View>
       </View>
+      
+      {!connected && (
+        <View style={styles.disconnectedMessage}>
+          <Text style={styles.disconnectedText}>
+            Connection lost. Please go back to menu and reconnect.
+          </Text>
+        </View>
+      )}
 
-      <Text style={styles.title}>File Sharing</Text>
+      {connected && (
+        <>
+          <Text style={styles.title}>File Sharing</Text>
 
-      <TouchableOpacity style={styles.button} onPress={handleSelectFile}>
-        <Text style={styles.buttonText}>Select File to Send</Text>
-      </TouchableOpacity>
+          <TouchableOpacity style={styles.button} onPress={handleSelectFile}>
+            <Text style={styles.buttonText}>Select File to Send</Text>
+          </TouchableOpacity>
+        </>
+      )}
 
       {incomingFile && (
         <View style={styles.incomingFile}>
@@ -380,12 +687,22 @@ export default function App() {
         <View style={styles.receivedFiles}>
           <Text style={styles.receivedFilesTitle}>Received Files:</Text>
           {receivedFiles.map((file, index) => (
-            <View key={index} style={styles.receivedFileItem}>
-              <Text style={styles.receivedFileName}>{file.name}</Text>
-              <Text style={styles.receivedFileTime}>
-                {file.receivedAt.toLocaleTimeString()}
-              </Text>
-            </View>
+            <TouchableOpacity
+              key={index}
+              style={styles.receivedFileItem}
+              onPress={() => handleOpenFile(file)}
+              activeOpacity={0.7}
+            >
+              <View style={styles.receivedFileInfo}>
+                <Text style={styles.receivedFileName}>{file.name}</Text>
+                <Text style={styles.receivedFileTime}>
+                  {file.receivedAt.toLocaleTimeString()}
+                </Text>
+              </View>
+              <View style={styles.openFileButton}>
+                <Text style={styles.openFileButtonText}>Open</Text>
+              </View>
+            </TouchableOpacity>
           ))}
         </View>
       )}
@@ -412,13 +729,15 @@ export default function App() {
   }
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar style="auto" />
-      {mode === 'menu' && renderMenu()}
-      {mode === 'scan' && renderScanner()}
-      {mode === 'generate' && renderQRGenerator()}
-      {mode === 'connected' && renderConnected()}
-    </SafeAreaView>
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+        <StatusBar style="auto" />
+        {mode === 'menu' && renderMenu()}
+        {mode === 'scan' && renderScanner()}
+        {mode === 'generate' && renderQRGenerator()}
+        {mode === 'connected' && renderConnected()}
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 
@@ -434,9 +753,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 20,
   },
+  scrollView: {
+    flex: 1,
+    backgroundColor: '#fff',
+  },
   scrollContent: {
     flexGrow: 1,
     alignItems: 'center',
+    justifyContent: 'center',
     padding: 20,
   },
   title: {
@@ -533,10 +857,27 @@ const styles = StyleSheet.create({
   connected: {
     backgroundColor: '#4caf50',
   },
+  disconnected: {
+    backgroundColor: '#ff9800',
+  },
   statusText: {
     color: '#fff',
     fontWeight: 'bold',
     fontSize: 16,
+  },
+  disconnectedMessage: {
+    backgroundColor: '#fff3cd',
+    padding: 15,
+    borderRadius: 8,
+    marginVertical: 15,
+    borderWidth: 1,
+    borderColor: '#ffc107',
+    width: '100%',
+  },
+  disconnectedText: {
+    color: '#856404',
+    fontSize: 14,
+    textAlign: 'center',
   },
   incomingFile: {
     width: '100%',
@@ -587,9 +928,29 @@ const styles = StyleSheet.create({
   },
   receivedFileItem: {
     backgroundColor: '#fff',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     padding: 10,
-    borderRadius: 5,
-    marginVertical: 5,
+    borderRadius: 8,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  receivedFileInfo: {
+    flex: 1,
+    marginRight: 10,
+  },
+  openFileButton: {
+    backgroundColor: '#667eea',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 6,
+  },
+  openFileButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
   },
   receivedFileName: {
     fontSize: 14,
@@ -602,3 +963,4 @@ const styles = StyleSheet.create({
     marginTop: 5,
   },
 });
+
